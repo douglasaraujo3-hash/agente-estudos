@@ -3,9 +3,8 @@ import fitz  # PyMuPDF
 import re
 import json
 import random
-import time  # Adicionado para as pausas estratégicas
+import time
 import google.generativeai as genai
-from collections import defaultdict
 
 # ==================== CONFIGURAÇÃO DA PÁGINA ====================
 st.set_page_config(page_title="Agente de Estudos Pro", layout="wide", initial_sidebar_state="expanded")
@@ -40,7 +39,6 @@ def get_gemini_model():
         
     genai.configure(api_key=api_key)
     
-    # Busca dinamicamente os modelos disponíveis
     modelos_disponiveis = []
     try:
         for m in genai.list_models():
@@ -53,23 +51,20 @@ def get_gemini_model():
             if "flash" in m:
                 modelo_escolhido = m
                 break
-                
         if not modelo_escolhido:
             for m in modelos_disponiveis:
                 if "pro" in m:
                     modelo_escolhido = m
                     break
-                    
         if not modelo_escolhido and modelos_disponiveis:
             modelo_escolhido = modelos_disponiveis[0]
             
         return genai.GenerativeModel(modelo_escolhido)
-        
     except Exception as e:
-        st.error(f"Erro ao buscar lista de modelos do Google: {e}")
+        st.error(f"Erro ao buscar lista de modelos: {e}")
         st.stop()
 
-# ==================== GERAÇÃO COM PAUSA ESTRATÉGICA (GRÁTIS) ====================
+# ==================== GERAÇÃO COM PAUSA ESTRATÉGICA ====================
 def llm_generate(prompt):
     tentativas = 3
     for i in range(tentativas):
@@ -79,17 +74,15 @@ def llm_generate(prompt):
             return response.text
         except Exception as e:
             erro_str = str(e)
-            # Detecta se bateu no limite do plano gratuito do Google
             if "429" in erro_str or "Quota" in erro_str:
                 if i < tentativas - 1:
-                    # Notifica o usuário e espera 32 segundos para o limite renovar
-                    st.toast("⏳ Limite de leitura rápida do plano grátis atingido. Aguardando 30 segundos...", icon="⏳")
+                    st.toast("⏳ O Google pediu uma pausa (plano gratuito). Retomando em 30 segundos...", icon="⏳")
                     time.sleep(32)
                 else:
-                    st.error("⚠️ O PDF é gigantesco e usamos todo o limite do minuto. Aguarde um pouquinho e clique de novo.")
+                    st.error("⚠️ Limite do minuto esgotado. Aguarde um pouco e clique novamente.")
                     return ""
             else:
-                st.error(f"Erro inesperado na API: {e}")
+                st.error(f"Erro inesperado: {e}")
                 return ""
 
 # ==================== EXTRAÇÃO DE PDF ====================
@@ -106,72 +99,61 @@ def extract_text_from_pdf(file_bytes):
         st.error(f"Erro ao ler PDF: {e}")
         return ""
 
-# ==================== FUNÇÕES DE IA ====================
-def generate_structured_summary(text, custom_instruction=""):
-    extra = f"\n\nInstrução adicional do usuário: {custom_instruction}" if custom_instruction else ""
+# ==================== FUNÇÕES DE IA (SOB DEMANDA) ====================
+def generate_structured_summary(text, comando_especifico=""):
+    foco = f"Foque EXCLUSIVAMENTE neste comando/assunto: {comando_especifico}" if comando_especifico else "Faça um resumo geral dos pontos principais."
+    
     prompt = f"""
-Crie um resumo ESQUEMATIZADO e COMPLETO do texto a seguir.
-- Organize em tópicos e subtópicos.
-- NÃO omita detalhes importantes (datas, prazos, fórmulas, exceções, exemplos).
-- Destaque **atualizações jurídicas recentes** e 💡 **dicas de professores**.{extra}
-- Seja fiel ao texto original.
+Você é um assistente de estudos. 
+{foco}
 
-Texto completo:
+- Organize em tópicos e subtópicos claros.
+- Destaque termos importantes e conceitos chave.
+- Seja fiel ao texto fornecido.
+
+Texto base para a busca:
 {text}
 
-Resumo Esquematizado:"""
-    
+Resposta:"""
     return llm_generate(prompt)
 
-def generate_flashcards(text, num_cards=30):
+def generate_flashcards(text, assunto="", num_cards=10):
+    foco = f"Foque APENAS neste assunto/comando: {assunto}" if assunto else "Gere os cards sobre os pontos mais importantes do texto."
+    
     prompt_cards = f"""
-Baseado no texto abaixo, crie EXATAMENTE {num_cards} flashcards para estudo. Foque nos pontos cruciais.
+Você é um criador de flashcards.
+{foco}
 
-Texto completo:
-{text}
-
+Crie EXATAMENTE {num_cards} flashcards Certo/Errado baseados no texto.
 RETORNE APENAS UM ARRAY JSON VÁLIDO. NÃO ESCREVA MAIS NADA ALÉM DO JSON.
 Formato obrigatório:
 [
-  {{"frente": "Afirmação que pode ser verdadeira ou falsa", "verso": "Certo/Errado. Explicação curta..."}},
-  {{"frente": "Outra afirmação...", "verso": "Certo/Errado. Explicação..."}}
+  {{"frente": "Afirmação que pode ser verdadeira ou falsa", "verso": "Certo/Errado. Explicação..."}}
 ]
+
+Texto base:
+{text}
 """
     result = llm_generate(prompt_cards)
-    
     if not result:
         return []
-        
     try:
         clean_json = result.strip().strip("```json").strip("```").strip()
         cards = json.loads(clean_json)
         return cards[:num_cards]
     except json.JSONDecodeError:
-        st.error("Falha ao interpretar os flashcards. A IA não retornou o formato correto. Tente novamente.")
+        st.error("Falha ao interpretar os flashcards. Tente simplificar o comando.")
         return []
 
-def extract_topics(text):
-    prompt = f"""Identifique os principais tópicos do texto abaixo. 
-Retorne APENAS um array JSON de strings, com no máximo 8 tópicos. Exemplo: ["Direito Civil", "Prazos", "Recursos"].
-
-Texto completo:
-{text}"""
-    
-    resposta = llm_generate(prompt)
-    if not resposta:
-        return ["Geral"]
-        
-    try:
-        clean_json = resposta.strip().strip("```json").strip("```").strip()
-        topicos = json.loads(clean_json)
-        return topicos[:8] if topicos else ["Geral"]
-    except:
-        return ["Geral"]
-
 def extract_questions_by_topic(text, topic, num_questions, banca=None):
-    filtro = f"Estilo da banca {banca}. " if banca else ""
+    filtro_banca = f"Simule o estilo da banca {banca}." if banca else ""
+    foco = f"O tema EXCLUSIVO das questões deve ser: '{topic}'" if topic else "Crie questões variadas sobre o texto."
+    
     prompt = f"""
-Crie EXATAMENTE {num_questions} questões de múltipla escolha baseadas no texto abaixo sobre o tópico "{topic}". {filtro}
+Crie EXATAMENTE {num_questions} questões de múltipla escolha baseadas no texto abaixo. 
+{foco}
+{filtro_banca}
+
 O formato DEVE ser exatamente este (separado por ---):
 
 ---
@@ -182,16 +164,15 @@ b) ...
 c) ...
 d) ...
 e) ...
-Gabarito: [Apenas a letra, ex: C]
+Gabarito: [Letra]
 ---
 
-Texto completo:
+Texto base:
 {text}
 """
     result = llm_generate(prompt)
     if not result:
         return []
-        
     questoes = [bloco.strip() for bloco in result.split('---') if 'Enunciado:' in bloco]
     return questoes[:num_questions]
 
@@ -200,11 +181,10 @@ if 'notebooks' not in st.session_state:
     st.session_state.notebooks = {}
 if 'active_notebook' not in st.session_state:
     st.session_state.active_notebook = None
-if 'show_delete_confirm' not in st.session_state:
-    st.session_state.show_delete_confirm = None
 
 # ==================== INTERFACE ====================
-st.title("📚 Agente de Estudos Pro — Online (Gemini)")
+st.title("📚 Agente de Estudos Pro — Modo Direto")
+st.caption("A IA só lê e processa o documento quando você dá um comando, economizando seus limites grátis.")
 
 with st.sidebar:
     st.header("🎨 Aparência")
@@ -215,43 +195,25 @@ with st.sidebar:
 
     st.markdown("---")
     st.header("🔑 API Gemini")
-    api_key = st.text_input("Chave da API Google Gemini", type="password")
+    api_key = st.text_input("Chave da API", type="password")
     if api_key:
         st.session_state.api_key = api_key
     if st.button("Salvar chave"):
-        st.success("Chave salva para esta sessão.")
-    st.info("Obtenha sua chave gratuita em https://aistudio.google.com/app/apikey")
+        st.success("Chave salva!")
     st.markdown("---")
 
     st.header("📓 Notebooks")
     novo = st.text_input("Novo notebook")
     if st.button("➕ Criar") and novo:
         if novo not in st.session_state.notebooks:
-            st.session_state.notebooks[novo] = {"pdfs": [], "texto": "", "topicos": []}
-            st.success(f"'{novo}' criado!")
+            st.session_state.notebooks[novo] = {"pdfs": [], "texto": ""}
+            st.success("Criado!")
             st.rerun()
-        else:
-            st.error("Já existe um notebook com este nome.")
 
     nomes = list(st.session_state.notebooks.keys())
     if nomes:
-        if st.session_state.active_notebook not in nomes:
-            st.session_state.active_notebook = nomes[0]
-        active = st.selectbox("Notebook Ativo", nomes, key="active_notebook_selector")
+        active = st.selectbox("Ativo", nomes)
         st.session_state.active_notebook = active
-        st.markdown("---")
-        with st.expander("⚙️ Gerenciar"):
-            if st.button("🗑️ Apagar"):
-                if st.session_state.show_delete_confirm != active:
-                    st.session_state.show_delete_confirm = active
-                    st.warning("Clique novamente para confirmar exclusão.")
-                else:
-                    del st.session_state.notebooks[active]
-                    st.session_state.show_delete_confirm = None
-                    if st.session_state.active_notebook == active:
-                        st.session_state.active_notebook = None
-                    st.success("Apagado.")
-                    st.rerun()
     else:
         st.info("Crie um notebook para começar.")
         st.stop()
@@ -260,65 +222,51 @@ if not st.session_state.active_notebook:
     st.stop()
 
 active = st.session_state.active_notebook
-st.subheader(f"📖 Notebook: {active}")
 
-# Upload de PDF
-uploaded = st.file_uploader("Arraste PDFs (texto selecionável)", type="pdf", accept_multiple_files=True, key=f"upload_{active}")
+# Upload de PDF (Agora ele SÓ extrai o texto, não analisa nada no fundo)
+uploaded = st.file_uploader(f"Carregar PDFs no notebook '{active}'", type="pdf", accept_multiple_files=True)
 if uploaded:
     for f in uploaded:
         if f.name not in st.session_state.notebooks[active]['pdfs']:
-            with st.spinner(f"Lendo {f.name}..."):
+            with st.spinner(f"Extraindo texto de {f.name}..."):
                 txt = extract_text_from_pdf(f.read())
                 if txt.strip():
                     st.session_state.notebooks[active]['pdfs'].append(f.name)
                     st.session_state.notebooks[active]['texto'] += txt + "\n\n"
                     st.success(f"✅ {f.name} carregado!")
-                else:
-                    st.error(f"❌ {f.name} não tem texto extraível. Use um PDF selecionável.")
-    
-    if st.session_state.notebooks[active]['texto']:
-        with st.spinner("Identificando tópicos do PDF..."):
-            st.session_state.notebooks[active]['topicos'] = extract_topics(st.session_state.notebooks[active]['texto'])
 
-if st.session_state.notebooks[active]['pdfs']:
-    st.caption(f"📚 PDFs carregados: {', '.join(st.session_state.notebooks[active]['pdfs'])}")
-    if st.button("🗑️ Limpar PDFs"):
-        st.session_state.notebooks[active] = {"pdfs": [], "texto": "", "topicos": []}
-        st.rerun()
-else:
-    st.warning("⬆️ Nenhum PDF carregado neste notebook ainda.")
+# Corte de segurança para o plano gratuito (Limita a ~50 páginas por vez)
+texto_completo = st.session_state.notebooks[active].get('texto', "")
+texto_seguro = texto_completo[:150000]
 
-texto_atual = st.session_state.notebooks[active]['texto']
+if len(texto_completo) > 150000:
+    st.info("💡 PDF muito longo! Para evitar bloqueio do Google gratuito, a IA analisará o limite máximo de segurança por vez (cerca de 50 páginas).")
 
-# Tabs principais
-tab1, tab2, tab3, tab4 = st.tabs(["📝 Resumo", "🃏 Flashcards", "❓ Questões", "🎯 Revisão"])
+if not texto_seguro:
+    st.warning("Nenhum texto carregado. Faça upload de um PDF.")
+    st.stop()
+
+# Tabs de Comando Direto
+tab1, tab2, tab3, tab4 = st.tabs(["📝 Resumo Sob Demanda", "🃏 Flashcards Direcionados", "❓ Questões Específicas", "💬 Consulta Livre (Chat)"])
 
 with tab1:
-    custom = st.text_area("Instruções adicionais (opcional):", placeholder="Ex: Destaque os prazos processuais e faça tabelas...", key="custom")
-    if st.button("🚀 Gerar Resumo"):
-        if texto_atual:
-            with st.spinner("O Gemini está analisando o documento completo..."):
-                st.session_state['resumo'] = generate_structured_summary(texto_atual, custom)
-            st.success("Resumo gerado!")
-        else:
-            st.error("Por favor, carregue um PDF primeiro.")
-    
+    st.subheader("Resumir partes específicas")
+    comando_resumo = st.text_input("O que você quer que a IA busque e resuma?", placeholder="Ex: Resuma as hipóteses de prisão preventiva")
+    if st.button("🚀 Gerar Resumo Direcionado"):
+        with st.spinner("Buscando no texto..."):
+            st.session_state['resumo'] = generate_structured_summary(texto_seguro, comando_resumo)
     if 'resumo' in st.session_state:
         st.markdown(st.session_state['resumo'])
 
 with tab2:
-    st.subheader("Flashcards de Revisão (Certo/Errado)")
-    n = st.slider("Quantidade (Máximo 50)", 5, 50, 15, 5)
+    st.subheader("Gerador de Flashcards")
+    comando_flash = st.text_input("Sobre qual assunto do PDF você quer os flashcards?", placeholder="Ex: Apenas sobre prazos processuais")
+    n = st.slider("Quantidade de Cards", 5, 30, 10, 5)
     
     if st.button("Gerar Flashcards"):
-        if texto_atual:
-            with st.spinner("Criando cards interativos..."):
-                st.session_state['flashcards'] = generate_flashcards(texto_atual, n)
-                st.session_state['card_idx'] = 0
-            if st.session_state.get('flashcards'):
-                st.success(f"{len(st.session_state['flashcards'])} cards gerados com sucesso.")
-        else:
-            st.error("Sem PDF carregado.")
+        with st.spinner("Extraindo e criando os cards..."):
+            st.session_state['flashcards'] = generate_flashcards(texto_seguro, comando_flash, n)
+            st.session_state['card_idx'] = 0
             
     if 'flashcards' in st.session_state and st.session_state['flashcards']:
         cards = st.session_state['flashcards']
@@ -327,18 +275,10 @@ with tab2:
         if idx < len(cards):
             card = cards[idx]
             st.markdown(f"### Card {idx+1} de {len(cards)}")
-            
             with st.container(border=True):
-                st.markdown(f"**{card.get('frente', 'Erro ao carregar frente')}**")
-            
+                st.markdown(f"**{card.get('frente', '')}**")
             with st.expander("Mostrar Resposta"):
-                verso = card.get('verso', 'Erro ao carregar verso')
-                if verso.upper().startswith("CERTO"):
-                    st.success(verso)
-                elif verso.upper().startswith("ERRADO"):
-                    st.error(verso)
-                else:
-                    st.info(verso)
+                st.write(card.get('verso', ''))
             
             c1, c2, c3 = st.columns([1,2,1])
             if c1.button("⬅️ Anterior") and idx > 0:
@@ -349,96 +289,64 @@ with tab2:
                 st.rerun()
 
 with tab3:
-    st.subheader("Bateria de Questões Inéditas")
-    if not texto_atual:
-        st.error("Carregue um PDF para gerar questões.")
-    else:
-        topicos = st.session_state.notebooks[active].get('topicos', ["Geral"])
-        banca = st.text_input("Simular estilo da banca (opcional)", placeholder="Ex: CEBRASPE, FGV, VUNESP")
-        total = st.number_input("Total de questões desejadas", 1, 30, 5)
+    st.subheader("Questões Sob Medida")
+    comando_questoes = st.text_input("Qual assunto exato você quer testar?", placeholder="Ex: Licitações e Contratos")
+    banca = st.text_input("Estilo da banca (opcional)", placeholder="Ex: FGV, VUNESP")
+    total = st.number_input("Total de questões desejadas", 1, 20, 5)
+    
+    if st.button("Iniciar Busca e Criar Quiz"):
+        with st.spinner("A IA está buscando esse assunto no PDF..."):
+            quiz = extract_questions_by_topic(texto_seguro, comando_questoes, total, banca)
+            if quiz:
+                st.session_state['quiz'] = quiz
+                st.session_state['q_idx'] = 0
+                st.session_state['respostas'] = []
+                st.session_state['gabaritos'] = []
+                st.session_state['quiz_fim'] = False
+                st.rerun()
+            else:
+                st.warning("Não achei esse assunto ou ocorreu um erro.")
+                
+    if 'quiz' in st.session_state and st.session_state['quiz'] and not st.session_state.get('quiz_fim', False):
+        idx = st.session_state['q_idx']
+        q_texto = st.session_state['quiz'][idx]
         
-        st.write("Distribuição (Selecione de quais tópicos deseja as questões):")
-        sliders = {}
-        cols = st.columns(min(len(topicos), 4)) 
-        for i, t in enumerate(topicos[:4]):
-            with cols[i]:
-                sliders[t] = st.slider(t, 0, total, 0, key=f"sl_{t}")
-                
-        soma = sum(sliders.values())
-        if soma != total:
-            st.warning(f"A soma das questões selecionadas ({soma}) deve ser igual ao total ({total}).")
-        else:
-            if st.button("Iniciar Quiz"):
-                quiz = []
-                with st.spinner("O Gemini está elaborando as questões..."):
-                    for t, q in sliders.items():
-                        if q > 0:
-                            quiz += extract_questions_by_topic(texto_atual, t, q, banca if banca else None)
-                
-                if quiz:
-                    random.shuffle(quiz)
-                    st.session_state['quiz'] = quiz
-                    st.session_state['q_idx'] = 0
-                    st.session_state['respostas'] = []
-                    st.session_state['gabaritos'] = []
-                    st.session_state['quiz_fim'] = False
-                    st.rerun()
-                else:
-                    st.error("Não foi possível gerar as questões. Tente novamente.")
-                    
-        if 'quiz' in st.session_state and st.session_state['quiz'] and not st.session_state.get('quiz_fim', False):
-            idx = st.session_state['q_idx']
-            q_texto = st.session_state['quiz'][idx]
+        st.markdown(f"### Questão {idx+1}/{len(st.session_state['quiz'])}")
+        display_q = re.sub(r'Gabarito:.*', '', q_texto, flags=re.IGNORECASE)
+        st.markdown(display_q)
+        
+        alt = re.findall(r'([a-e])\)\s*(.*)', q_texto)
+        gab = re.search(r'Gabarito:\s*([a-eA-E])', q_texto)
+        gab_letra = gab.group(1).upper() if gab else None
+        
+        resp = st.radio("Sua resposta:", [a[0].upper() for a in alt] if alt else ["A","B","C","D","E"], key=f"resp_{idx}")
+        if st.button("Confirmar", key=f"prox_{idx}"):
+            st.session_state['respostas'].append(resp)
+            st.session_state['gabaritos'].append(gab_letra)
+            if idx+1 < len(st.session_state['quiz']):
+                st.session_state['q_idx'] += 1
+            else:
+                st.session_state['quiz_fim'] = True
+            st.rerun()
             
-            st.markdown(f"### Questão {idx+1}/{len(st.session_state['quiz'])}")
-            
-            display_q = re.sub(r'Gabarito:.*', '', q_texto, flags=re.IGNORECASE)
-            st.markdown(display_q)
-            
-            alt = re.findall(r'([a-e])\)\s*(.*)', q_texto)
-            gab = re.search(r'Gabarito:\s*([a-eA-E])', q_texto)
-            gab_letra = gab.group(1).upper() if gab else None
-            
-            resp = st.radio("Sua resposta:", [a[0].upper() for a in alt] if alt else ["A","B","C","D","E"], key=f"resp_{idx}")
-            
-            if st.button("Confirmar e ir para próxima", key=f"prox_{idx}"):
-                st.session_state['respostas'].append(resp)
-                st.session_state['gabaritos'].append(gab_letra)
-                if idx+1 < len(st.session_state['quiz']):
-                    st.session_state['q_idx'] += 1
-                else:
-                    st.session_state['quiz_fim'] = True
-                st.rerun()
-                
-        elif st.session_state.get('quiz_fim'):
-            st.success("Quiz finalizado! Veja seu desempenho.")
-            acertos = 0
-            for i, q in enumerate(st.session_state['quiz']):
-                r_user = st.session_state['respostas'][i] if i < len(st.session_state['respostas']) else None
-                gab = st.session_state['gabaritos'][i]
-                if r_user and gab and r_user == gab:
-                    acertos += 1
-            
-            total_q = len(st.session_state['quiz'])
-            st.metric("Acertos", f"{acertos}/{total_q}", f"{(acertos/total_q)*100:.0f}%")
-            if acertos < total_q:
-                st.session_state['topicos_revisar'] = topicos[:1] 
-                st.info("Alguns erros detectados. Vá para a aba 'Revisão'.")
-            
-            if st.button("Limpar e Tentar Novamente"):
-                del st.session_state['quiz']
-                st.rerun()
+    elif st.session_state.get('quiz_fim'):
+        acertos = sum(1 for i, q in enumerate(st.session_state['quiz']) if i < len(st.session_state['respostas']) and st.session_state['respostas'][i] == st.session_state['gabaritos'][i])
+        total_q = len(st.session_state['quiz'])
+        st.success("Quiz finalizado!")
+        st.metric("Acertos", f"{acertos}/{total_q}", f"{(acertos/total_q)*100:.0f}%")
+        if st.button("Fazer novo Quiz"):
+            del st.session_state['quiz']
+            st.rerun()
 
 with tab4:
-    st.subheader("Revisão Inteligente dos Erros")
-    if st.button("Gerar material de revisão"):
-        if not texto_atual:
-            st.warning("Carregue um texto primeiro.")
+    st.subheader("💬 Consulta Livre (Converse com o PDF)")
+    st.write("Tem uma dúvida pontual? Digite abaixo e a IA vai buscar a resposta dentro do PDF.")
+    pergunta_direta = st.text_input("Faça uma pergunta sobre o texto:")
+    
+    if st.button("Buscar resposta no PDF"):
+        if pergunta_direta:
+            with st.spinner("Procurando..."):
+                prompt = f"Responda a esta pergunta baseando-se EXCLUSIVAMENTE no texto abaixo. Pergunta: {pergunta_direta}\n\nTexto:\n{texto_seguro}"
+                st.info(llm_generate(prompt))
         else:
-            erros = st.session_state.get('topicos_revisar', st.session_state.notebooks[active].get('topicos', ['Geral'])[:1])
-            with st.spinner("Criando resumo de reforço com o Gemini..."):
-                for top in erros:
-                    st.markdown(f"### 📌 Reforço de Conteúdo: {top}")
-                    prompt = f"Crie um resumo rápido e focado apenas no assunto '{top}'. Texto base: {texto_atual}"
-                    st.markdown(llm_generate(prompt))
-            st.success("Material de revisão gerado!")
+            st.warning("Digite uma pergunta primeiro.")
