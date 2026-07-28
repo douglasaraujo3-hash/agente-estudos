@@ -5,7 +5,6 @@ import google.generativeai as genai
 from collections import defaultdict
 import random
 import json
-import time
 
 # ==================== CONFIGURAÇÃO DA PÁGINA ====================
 st.set_page_config(
@@ -57,24 +56,35 @@ def get_gemini_model():
     if not api_key:
         st.error("⚠️ Chave da API Gemini não configurada. Insira na barra lateral.")
         st.stop()
+
     genai.configure(api_key=api_key)
-    # Usa Gemini 1.5 Flash (rápido e gratuito)
-    return genai.GenerativeModel('gemini-1.5-flash-latest')
+
+    # Lista modelos e escolhe o gemini-1.5-flash (ou fallback)
+    try:
+        models = genai.list_models()
+        model_name = None
+        for model in models:
+            if 'generateContent' in model.supported_generation_methods and 'gemini-1.5-flash' in model.name:
+                model_name = model.name
+                break
+        if model_name is None:
+            model_name = 'models/gemini-1.5-flash'  # fallback
+        return genai.GenerativeModel(model_name)
+    except Exception as e:
+        st.error(f"Erro ao conectar à API Gemini: {e}. Verifique sua chave.")
+        st.stop()
 
 def llm_generate(prompt, max_tokens=2000, temperature=0.1):
     model = get_gemini_model()
     try:
-        # A API Gemini usa 'max_output_tokens' e 'temperature' no generation_config
-        response = model.generate_content(
-            prompt,
-            generation_config=genai.types.GenerationConfig(
-                max_output_tokens=max_tokens,
-                temperature=temperature
-            )
+        generation_config = genai.types.GenerationConfig(
+            max_output_tokens=max_tokens,
+            temperature=temperature
         )
+        response = model.generate_content(prompt, generation_config=generation_config)
         return response.text
     except Exception as e:
-        st.error(f"Erro na API Gemini: {e}")
+        st.error(f"Erro na API Gemini: {e}. Tente novamente.")
         return ""
 
 # ==================== FUNÇÕES DE EXTRAÇÃO E IA ====================
@@ -232,7 +242,7 @@ with st.sidebar:
         st.session_state.gemini_api_key = api_key
     if st.button("Salvar chave"):
         st.success("Chave salva para esta sessão.")
-    st.info("Obtenha sua chave gratuita em makersuite.google.com/app/apikey")
+    st.info("Obtenha sua chave gratuita em https://makersuite.google.com/app/apikey")
     st.markdown("---")
 
     st.header("📓 Notebooks")
@@ -324,7 +334,6 @@ tab_resumo, tab_flash, tab_questoes, tab_revisao = st.tabs(
 
 with tab_resumo:
     st.header("📝 Resumo Esquematizado (Personalizável)")
-    # CAMPO PARA DIGITAR O QUE QUER NO RESUMO
     custom_resumo = st.text_area(
         "✨ Instruções para o resumo (opcional):",
         placeholder="Ex: Dê destaque a prazos, inclua jurisprudência do STF, explique como se fosse para um leigo...",
