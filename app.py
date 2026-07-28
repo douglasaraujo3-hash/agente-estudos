@@ -1,7 +1,7 @@
 import streamlit as st
 import fitz  # PyMuPDF
 import re
-from openai import OpenAI
+from groq import Groq  # pip install groq
 from collections import defaultdict
 import random
 import json
@@ -29,28 +29,28 @@ def apply_theme():
 
 apply_theme()
 
-# ==================== CONEXÃO DEEPSEEK ====================
-def get_deepseek_client():
-    api_key = st.session_state.get("deepseek_api_key", "")
+# ==================== CONEXÃO GROQ ====================
+def get_groq_client():
+    api_key = st.session_state.get("groq_api_key", "")
     if not api_key:
-        api_key = st.secrets.get("DEEPSEEK_API_KEY", "")
+        api_key = st.secrets.get("GROQ_API_KEY", "")
     if not api_key:
-        st.error("⚠️ Chave da API DeepSeek não configurada. Insira na barra lateral.")
+        st.error("⚠️ Chave da API Groq não configurada. Insira na barra lateral.")
         st.stop()
-    return OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
+    return Groq(api_key=api_key)
 
-def llm_generate(prompt, max_tokens=2000, temperature=0.1):
+def llm_generate(prompt, max_tokens=2000, temperature=0.1, model="llama-3.1-8b-instant"):
     try:
-        client = get_deepseek_client()
+        client = get_groq_client()
         response = client.chat.completions.create(
-            model="deepseek-chat",
+            model=model,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=max_tokens,
             temperature=temperature,
         )
         return response.choices[0].message.content
     except Exception as e:
-        st.error(f"Erro na API DeepSeek: {e}")
+        st.error(f"Erro na API Groq: {e}")
         return ""
 
 # ==================== EXTRAÇÃO DE PDF ====================
@@ -107,7 +107,10 @@ Flashcards ({num_cards}):"""
     for match in re.findall(pattern, result, re.DOTALL):
         frente, verso = match[0].strip(), match[1].strip()
         if not (verso.startswith("Certo") or verso.startswith("Errado")):
-            verso = "Certo" if "certo" in verso.lower() else ("Errado" if "errado" in verso.lower() else verso)
+            if "certo" in verso.lower():
+                verso = "Certo " + verso
+            elif "errado" in verso.lower():
+                verso = "Errado " + verso
         cards.append({"frente": frente, "verso": verso})
 
     if len(cards) > num_cards:
@@ -142,7 +145,8 @@ Flashcards adicionais (se necessário):"""
 def extract_topics(text):
     prompt = "Identifique os principais tópicos/assuntos do texto. Retorne uma lista, um por linha, no máximo 8.\n\nTexto:\n" + text[:80000] + "\n\nTópicos:"
     resposta = llm_generate(prompt, max_tokens=300)
-    return [t.strip() for t in resposta.split('\n') if t.strip()][:8]
+    topicos = [t.strip() for t in resposta.split('\n') if t.strip()]
+    return topicos[:8] if topicos else ["Geral"]
 
 def extract_questions_by_topic(text, topic, num_questions, banca=None):
     filtro = f"Filtrar apenas questões da banca {banca}. " if banca else ""
@@ -177,7 +181,7 @@ if 'show_delete_confirm' not in st.session_state:
     st.session_state.show_delete_confirm = None
 
 # ==================== INTERFACE ====================
-st.title("📚 Agente de Estudos Pro — Online (DeepSeek 500 req/dia grátis)")
+st.title("📚 Agente de Estudos Pro — Online (Groq, gratuito)")
 
 with st.sidebar:
     st.header("🎨 Aparência")
@@ -187,13 +191,13 @@ with st.sidebar:
         st.rerun()
 
     st.markdown("---")
-    st.header("🔑 API DeepSeek")
-    api_key = st.text_input("Chave da API DeepSeek", type="password")
+    st.header("🔑 API Groq")
+    api_key = st.text_input("Chave da API Groq", type="password")
     if api_key:
-        st.session_state.deepseek_api_key = api_key
+        st.session_state.groq_api_key = api_key
     if st.button("Salvar chave"):
         st.success("Chave salva para esta sessão.")
-    st.info("Obtenha sua chave gratuita em https://platform.deepseek.com (500 req/dia)")
+    st.info("Obtenha sua chave gratuita em https://console.groq.com/keys (sem cartão)")
     st.markdown("---")
 
     st.header("📓 Notebooks")
@@ -255,7 +259,7 @@ active = st.session_state.active_notebook
 st.subheader(f"📖 {active}")
 
 # Upload de PDF
-uploaded = st.file_uploader("Arraste PDFs", type="pdf", accept_multiple_files=True, key=f"upload_{active}")
+uploaded = st.file_uploader("Arraste PDFs (texto selecionável)", type="pdf", accept_multiple_files=True, key=f"upload_{active}")
 if uploaded:
     for f in uploaded:
         if f.name not in st.session_state.notebooks[active]['pdfs']:
@@ -266,7 +270,7 @@ if uploaded:
                     st.session_state.notebooks[active]['texto'] += txt + "\n\n"
                     st.success(f"✅ {f.name} ({len(txt)} caracteres)")
                 else:
-                    st.error(f"❌ {f.name} não pôde ser lido.")
+                    st.error(f"❌ {f.name} não tem texto. Use um PDF com texto selecionável ou converta escaneados com OCR (ex: iLovePDF).")
     if st.session_state.notebooks[active]['texto']:
         with st.spinner("Identificando tópicos..."):
             st.session_state.notebooks[active]['topicos'] = extract_topics(st.session_state.notebooks[active]['texto'])
@@ -335,6 +339,8 @@ with tab3:
         st.error("Sem PDF.")
     else:
         topicos = st.session_state.notebooks[active].get('topicos', ["Geral"])
+        if not topicos:
+            topicos = ["Geral"]
         banca = st.text_input("Filtrar banca (opcional)", "")
         total = st.number_input("Total questões", 1, 50, 10)
         st.write("Distribuição:")
