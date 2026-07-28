@@ -1,15 +1,14 @@
 import streamlit as st
 import fitz  # PyMuPDF
 import re
-from groq import Groq  # pip install groq
-from collections import defaultdict
-import random
 import json
+import random
+import google.generativeai as genai
+from collections import defaultdict
 
 # ==================== CONFIGURAÇÃO DA PÁGINA ====================
 st.set_page_config(page_title="Agente de Estudos Pro", layout="wide", initial_sidebar_state="expanded")
 
-# ==================== MODO ESCURO ====================
 if 'dark_mode' not in st.session_state:
     st.session_state.dark_mode = False
 
@@ -29,150 +28,125 @@ def apply_theme():
 
 apply_theme()
 
-# ==================== CONEXÃO GROQ ====================
-def get_groq_client():
-    api_key = st.session_state.get("groq_api_key", "")
+# ==================== CONEXÃO GEMINI ====================
+def get_gemini_model():
+    api_key = st.session_state.get("api_key", "")
     if not api_key:
-        api_key = st.secrets.get("GROQ_API_KEY", "")
+        # Tenta pegar das configurações de Secrets do Streamlit Cloud
+        api_key = st.secrets.get("GEMINI_API_KEY", "")
     if not api_key:
-        st.error("⚠️ Chave da API Groq não configurada. Insira na barra lateral.")
+        st.error("⚠️ Chave da API do Google Gemini não configurada. Insira na barra lateral.")
         st.stop()
-    return Groq(api_key=api_key)
+        
+    genai.configure(api_key=api_key)
+    # gemini-1.5-flash é super rápido e suporta milhões de tokens (lê PDFs inteiros)
+    return genai.GenerativeModel('gemini-1.5-flash')
 
-def llm_generate(prompt, max_tokens=2000, temperature=0.1, model="llama-3.1-8b-instant"):
+def llm_generate(prompt):
     try:
-        client = get_groq_client()
-        response = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
-        return response.choices[0].message.content
+        model = get_gemini_model()
+        response = model.generate_content(prompt)
+        return response.text
     except Exception as e:
-        st.error(f"Erro na API Groq: {e}")
+        st.error(f"Erro na API do Gemini: {e}")
         return ""
 
 # ==================== EXTRAÇÃO DE PDF ====================
 def extract_text_from_pdf(file_bytes):
-    doc = fitz.open(stream=file_bytes, filetype="pdf")
-    text = ""
-    for page in doc:
-        text += page.get_text()
-    doc.close()
-    return text
+    try:
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        text = ""
+        for page in doc:
+            text += page.get_text("text") + "\n"
+        doc.close()
+        # Limpeza básica de quebras de linha em excesso
+        text = re.sub(r'\n+', '\n', text)
+        return text
+    except Exception as e:
+        st.error(f"Erro ao ler PDF: {e}")
+        return ""
 
-# ==================== FUNÇÕES DE IA ====================
+# ==================== FUNÇÕES DE IA (GEMINI LENDO TUDO) ====================
 def generate_structured_summary(text, custom_instruction=""):
-    chunk_size = 60000
-    chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
-    summaries = []
-    for i, chunk in enumerate(chunks):
-        extra = f"\n\nInstrução adicional do usuário: {custom_instruction}" if custom_instruction else ""
-        prompt = f"""
+    extra = f"\n\nInstrução adicional do usuário: {custom_instruction}" if custom_instruction else ""
+    prompt = f"""
 Crie um resumo ESQUEMATIZADO e COMPLETO do texto a seguir.
 - Organize em tópicos e subtópicos.
 - NÃO omita detalhes importantes (datas, prazos, fórmulas, exceções, exemplos).
 - Destaque **atualizações jurídicas recentes** e 💡 **dicas de professores**.{extra}
 - Seja fiel ao texto original.
 
-Texto (parte {i+1} de {len(chunks)}):
-{chunk}
+Texto completo:
+{text}
 
 Resumo Esquematizado:"""
-        summaries.append(llm_generate(prompt, max_tokens=3000))
-    return "\n\n".join(summaries)
+    
+    return llm_generate(prompt)
 
-def generate_flashcards(text, num_cards=70, check_coverage=False):
-    prompt_extract = f"Liste TODOS os pontos importantes do texto abaixo que podem cair em prova. Seja exaustivo.\n\nTexto:\n{text[:120000]}\n\nLista:"
-    pontos = llm_generate(prompt_extract, max_tokens=3000)
+def generate_flashcards(text, num_cards=30):
+    prompt_cards = f"""
+Baseado no texto abaixo, crie EXATAMENTE {num_cards} flashcards para estudo. Foque nos pontos cruciais.
 
-    prompt_cards = f"""A partir da lista de pontos abaixo, crie EXATAMENTE {num_cards} flashcards no formato:
-Frente: [afirmação clara que pode ser verdadeira ou falsa]
-Verso: [Certo ou Errado] + explicação completa + uma mini revisão do assunto (2-3 frases resumindo o conceito)
+Texto completo:
+{text}
 
-Regras:
-- Mescle pontos relacionados, mas NÃO omita informações.
-- Garanta que o total seja exatamente {num_cards}.
-- Apenas os flashcards, sem texto adicional.
-
-Lista de pontos:
-{pontos}
-
-Flashcards ({num_cards}):"""
-    result = llm_generate(prompt_cards, max_tokens=4000)
-
-    cards = []
-    pattern = r"Frente:\s*(.*?)\nVerso:\s*(.*?)(?=\nFrente:|\Z)"
-    for match in re.findall(pattern, result, re.DOTALL):
-        frente, verso = match[0].strip(), match[1].strip()
-        if not (verso.startswith("Certo") or verso.startswith("Errado")):
-            if "certo" in verso.lower():
-                verso = "Certo " + verso
-            elif "errado" in verso.lower():
-                verso = "Errado " + verso
-        cards.append({"frente": frente, "verso": verso})
-
-    if len(cards) > num_cards:
-        cards = cards[:num_cards]
-    elif len(cards) < num_cards:
-        extra = llm_generate(f"Ainda faltam {num_cards - len(cards)} flashcards. Gere-os.", max_tokens=1000)
-        for match in re.findall(pattern, extra, re.DOTALL):
-            cards.append({"frente": match[0].strip(), "verso": match[1].strip()})
-        cards = cards[:num_cards]
-
-    if check_coverage and cards:
-        with st.spinner("Verificando cobertura..."):
-            prompt_verify = f"""
-Analise o texto original e a lista de flashcards abaixo.
-Se algum ponto importante foi omitido, crie flashcards adicionais (até 20).
-
-Texto original:
-{text[:120000]}
-
-Flashcards atuais:
-{json.dumps(cards, ensure_ascii=False, indent=2)}
-
-Flashcards adicionais (se necessário):"""
-            verification = llm_generate(prompt_verify, max_tokens=1000)
-            for match in re.findall(pattern, verification, re.DOTALL):
-                cards.append({"frente": match[0].strip(), "verso": match[1].strip()})
-            max_total = int(num_cards * 1.2)
-            if len(cards) > max_total:
-                cards = cards[:max_total]
-    return cards
+RETORNE APENAS UM ARRAY JSON VÁLIDO. NÃO ESCREVA MAIS NADA ALÉM DO JSON.
+Formato obrigatório:
+[
+  {{"frente": "Afirmação que pode ser verdadeira ou falsa", "verso": "Certo/Errado. Explicação curta..."}},
+  {{"frente": "Outra afirmação...", "verso": "Certo/Errado. Explicação..."}}
+]
+"""
+    result = llm_generate(prompt_cards)
+    
+    try:
+        clean_json = result.strip().strip("```json").strip("```").strip()
+        cards = json.loads(clean_json)
+        return cards[:num_cards]
+    except json.JSONDecodeError:
+        st.error("Falha ao interpretar os flashcards. A IA não retornou o formato correto.")
+        return []
 
 def extract_topics(text):
-    prompt = "Identifique os principais tópicos/assuntos do texto. Retorne uma lista, um por linha, no máximo 8.\n\nTexto:\n" + text[:80000] + "\n\nTópicos:"
-    resposta = llm_generate(prompt, max_tokens=300)
-    topicos = [t.strip() for t in resposta.split('\n') if t.strip()]
-    return topicos[:8] if topicos else ["Geral"]
+    prompt = f"""Identifique os principais tópicos do texto abaixo. 
+Retorne APENAS um array JSON de strings, com no máximo 8 tópicos. Exemplo: ["Direito Civil", "Prazos", "Recursos"].
+
+Texto completo:
+{text}"""
+    
+    resposta = llm_generate(prompt)
+    try:
+        clean_json = resposta.strip().strip("```json").strip("```").strip()
+        topicos = json.loads(clean_json)
+        return topicos[:8] if topicos else ["Geral"]
+    except:
+        return ["Geral"]
 
 def extract_questions_by_topic(text, topic, num_questions, banca=None):
-    filtro = f"Filtrar apenas questões da banca {banca}. " if banca else ""
+    filtro = f"Estilo da banca {banca}. " if banca else ""
     prompt = f"""
-Do texto abaixo, extraia EXATAMENTE {num_questions} questões de concurso sobre "{topic}". {filtro}As questões devem ser CÓPIAS FIÉIS do texto.
-Formato para cada questão:
+Crie EXATAMENTE {num_questions} questões de múltipla escolha baseadas no texto abaixo sobre o tópico "{topic}". {filtro}
+O formato DEVE ser exatamente este (separado por ---):
+
 ---
-Enunciado: (copiado literalmente)
+Enunciado: [Texto da questão]
 Alternativas:
 a) ...
 b) ...
 c) ...
 d) ...
 e) ...
-Gabarito: (letra correta)
+Gabarito: [Apenas a letra, ex: C]
 ---
 
-Texto:
-{text[:120000]}
-
-Questões:"""
-    result = llm_generate(prompt, max_tokens=2000)
+Texto completo:
+{text}
+"""
+    result = llm_generate(prompt)
     questoes = [bloco.strip() for bloco in result.split('---') if 'Enunciado:' in bloco]
     return questoes[:num_questions]
 
-# ==================== ESTADO ====================
+# ==================== ESTADO DA APLICAÇÃO ====================
 if 'notebooks' not in st.session_state:
     st.session_state.notebooks = {}
 if 'active_notebook' not in st.session_state:
@@ -181,7 +155,7 @@ if 'show_delete_confirm' not in st.session_state:
     st.session_state.show_delete_confirm = None
 
 # ==================== INTERFACE ====================
-st.title("📚 Agente de Estudos Pro — Online (Groq, gratuito)")
+st.title("📚 Agente de Estudos Pro — Online (Gemini)")
 
 with st.sidebar:
     st.header("🎨 Aparência")
@@ -191,13 +165,13 @@ with st.sidebar:
         st.rerun()
 
     st.markdown("---")
-    st.header("🔑 API Groq")
-    api_key = st.text_input("Chave da API Groq", type="password")
+    st.header("🔑 API Gemini")
+    api_key = st.text_input("Chave da API Google Gemini", type="password")
     if api_key:
-        st.session_state.groq_api_key = api_key
+        st.session_state.api_key = api_key
     if st.button("Salvar chave"):
         st.success("Chave salva para esta sessão.")
-    st.info("Obtenha sua chave gratuita em https://console.groq.com/keys (sem cartão)")
+    st.info("Obtenha sua chave gratuita em https://aistudio.google.com/app/apikey")
     st.markdown("---")
 
     st.header("📓 Notebooks")
@@ -208,39 +182,20 @@ with st.sidebar:
             st.success(f"'{novo}' criado!")
             st.rerun()
         else:
-            st.error("Já existe.")
+            st.error("Já existe um notebook com este nome.")
 
     nomes = list(st.session_state.notebooks.keys())
     if nomes:
         if st.session_state.active_notebook not in nomes:
             st.session_state.active_notebook = nomes[0]
-        active = st.selectbox("Ativo", nomes, key="active_notebook_selector")
+        active = st.selectbox("Notebook Ativo", nomes, key="active_notebook_selector")
         st.session_state.active_notebook = active
         st.markdown("---")
         with st.expander("⚙️ Gerenciar"):
-            novo_nome = st.text_input("Renomear", value=active, key="rename_input")
-            if st.button("✏️ Renomear") and novo_nome != active:
-                if novo_nome not in st.session_state.notebooks:
-                    st.session_state.notebooks[novo_nome] = st.session_state.notebooks.pop(active)
-                    if st.session_state.active_notebook == active:
-                        st.session_state.active_notebook = novo_nome
-                    st.success("Renomeado.")
-                    st.rerun()
-                else:
-                    st.error("Nome já existe.")
-            if st.button("📋 Duplicar"):
-                copia = f"Cópia de {active}"
-                i=1
-                while copia in st.session_state.notebooks:
-                    copia = f"Cópia ({i}) de {active}"
-                    i+=1
-                st.session_state.notebooks[copia] = json.loads(json.dumps(st.session_state.notebooks[active]))
-                st.success(f"Duplicado: {copia}")
-                st.rerun()
             if st.button("🗑️ Apagar"):
                 if st.session_state.show_delete_confirm != active:
                     st.session_state.show_delete_confirm = active
-                    st.warning("Clique novamente para confirmar.")
+                    st.warning("Clique novamente para confirmar exclusão.")
                 else:
                     del st.session_state.notebooks[active]
                     st.session_state.show_delete_confirm = None
@@ -256,7 +211,7 @@ if not st.session_state.active_notebook:
     st.stop()
 
 active = st.session_state.active_notebook
-st.subheader(f"📖 {active}")
+st.subheader(f"📖 Notebook: {active}")
 
 # Upload de PDF
 uploaded = st.file_uploader("Arraste PDFs (texto selecionável)", type="pdf", accept_multiple_files=True, key=f"upload_{active}")
@@ -268,152 +223,174 @@ if uploaded:
                 if txt.strip():
                     st.session_state.notebooks[active]['pdfs'].append(f.name)
                     st.session_state.notebooks[active]['texto'] += txt + "\n\n"
-                    st.success(f"✅ {f.name} ({len(txt)} caracteres)")
+                    st.success(f"✅ {f.name} carregado!")
                 else:
-                    st.error(f"❌ {f.name} não tem texto. Use um PDF com texto selecionável ou converta escaneados com OCR (ex: iLovePDF).")
+                    st.error(f"❌ {f.name} não tem texto extraível. Use um PDF selecionável.")
+    
     if st.session_state.notebooks[active]['texto']:
         with st.spinner("Identificando tópicos..."):
             st.session_state.notebooks[active]['topicos'] = extract_topics(st.session_state.notebooks[active]['texto'])
 
 if st.session_state.notebooks[active]['pdfs']:
-    st.caption(f"📚 PDFs: {', '.join(st.session_state.notebooks[active]['pdfs'])}")
-    st.caption(f"📊 Caracteres: {len(st.session_state.notebooks[active]['texto'])}")
-    if st.button("🗑️ Remover todos"):
+    st.caption(f"📚 PDFs carregados: {', '.join(st.session_state.notebooks[active]['pdfs'])}")
+    if st.button("🗑️ Limpar PDFs"):
         st.session_state.notebooks[active] = {"pdfs": [], "texto": "", "topicos": []}
         st.rerun()
 else:
-    st.warning("⬆️ Nenhum PDF carregado.")
+    st.warning("⬆️ Nenhum PDF carregado neste notebook ainda.")
 
 texto_atual = st.session_state.notebooks[active]['texto']
 
-# Tabs
+# Tabs principais
 tab1, tab2, tab3, tab4 = st.tabs(["📝 Resumo", "🃏 Flashcards", "❓ Questões", "🎯 Revisão"])
 
 with tab1:
-    custom = st.text_area("Instruções (opcional):", placeholder="Ex: Destaque prazos, inclua jurisprudência...", key="custom")
+    custom = st.text_area("Instruções adicionais (opcional):", placeholder="Ex: Destaque os prazos processuais e faça tabelas...", key="custom")
     if st.button("🚀 Gerar Resumo"):
         if texto_atual:
-            with st.spinner("Gerando..."):
+            with st.spinner("O Gemini está analisando o documento completo..."):
                 st.session_state['resumo'] = generate_structured_summary(texto_atual, custom)
-            st.success("Pronto!")
+            st.success("Resumo gerado!")
         else:
-            st.error("Sem PDF.")
+            st.error("Por favor, carregue um PDF primeiro.")
+    
     if 'resumo' in st.session_state:
         st.markdown(st.session_state['resumo'])
 
 with tab2:
-    st.subheader("Flashcards Certo/Errado")
-    n = st.slider("Quantidade", 10, 300, 70, 10)
-    verif = st.checkbox("Verificar cobertura", True)
+    st.subheader("Flashcards de Revisão (Certo/Errado)")
+    n = st.slider("Quantidade (Máximo 50)", 5, 50, 15, 5)
+    
     if st.button("Gerar Flashcards"):
         if texto_atual:
-            with st.spinner("Criando..."):
-                st.session_state['flashcards'] = generate_flashcards(texto_atual, n, verif)
+            with st.spinner("Criando cards interativos..."):
+                st.session_state['flashcards'] = generate_flashcards(texto_atual, n)
                 st.session_state['card_idx'] = 0
-            st.success(f"{len(st.session_state['flashcards'])} cards gerados.")
+            if st.session_state.get('flashcards'):
+                st.success(f"{len(st.session_state['flashcards'])} cards gerados com sucesso.")
         else:
-            st.error("Sem PDF.")
-    if 'flashcards' in st.session_state:
+            st.error("Sem PDF carregado.")
+            
+    if 'flashcards' in st.session_state and st.session_state['flashcards']:
         cards = st.session_state['flashcards']
         idx = st.session_state.get('card_idx', 0)
-        card = cards[idx]
-        st.markdown(f"### Card {idx+1}/{len(cards)}")
-        with st.expander("Afirmação", expanded=True):
-            st.write(card['frente'])
-        with st.expander("Resposta"):
-            if card['verso'].startswith("Certo"):
-                st.success(card['verso'])
-            elif card['verso'].startswith("Errado"):
-                st.error(card['verso'])
-            else:
-                st.write(card['verso'])
-        c1,_,c3 = st.columns([1,2,1])
-        if c1.button("⬅️") and idx>0:
-            st.session_state['card_idx']-=1; st.rerun()
-        if c3.button("➡️") and idx<len(cards)-1:
-            st.session_state['card_idx']+=1; st.rerun()
+        
+        if idx < len(cards):
+            card = cards[idx]
+            st.markdown(f"### Card {idx+1} de {len(cards)}")
+            
+            with st.container(border=True):
+                st.markdown(f"**{card.get('frente', 'Erro ao carregar frente')}**")
+            
+            with st.expander("Mostrar Resposta"):
+                verso = card.get('verso', 'Erro ao carregar verso')
+                if verso.upper().startswith("CERTO"):
+                    st.success(verso)
+                elif verso.upper().startswith("ERRADO"):
+                    st.error(verso)
+                else:
+                    st.info(verso)
+            
+            c1, c2, c3 = st.columns([1,2,1])
+            if c1.button("⬅️ Anterior") and idx > 0:
+                st.session_state['card_idx'] -= 1
+                st.rerun()
+            if c3.button("Próximo ➡️") and idx < len(cards)-1:
+                st.session_state['card_idx'] += 1
+                st.rerun()
 
 with tab3:
-    st.subheader("Questões dos PDFs")
+    st.subheader("Bateria de Questões Inéditas")
     if not texto_atual:
-        st.error("Sem PDF.")
+        st.error("Carregue um PDF para gerar questões.")
     else:
         topicos = st.session_state.notebooks[active].get('topicos', ["Geral"])
-        if not topicos:
-            topicos = ["Geral"]
-        banca = st.text_input("Filtrar banca (opcional)", "")
-        total = st.number_input("Total questões", 1, 50, 10)
-        st.write("Distribuição:")
+        banca = st.text_input("Simular estilo da banca (opcional)", placeholder="Ex: CEBRASPE, FGV, VUNESP")
+        total = st.number_input("Total de questões desejadas", 1, 30, 5)
+        
+        st.write("Distribuição (Selecione de quais tópicos deseja as questões):")
         sliders = {}
-        cols = st.columns(len(topicos))
-        for i, t in enumerate(topicos):
+        cols = st.columns(min(len(topicos), 4)) 
+        for i, t in enumerate(topicos[:4]):
             with cols[i]:
                 sliders[t] = st.slider(t, 0, total, 0, key=f"sl_{t}")
-        if sum(sliders.values()) != total:
-            st.warning(f"Soma deve ser {total}.")
+                
+        soma = sum(sliders.values())
+        if soma != total:
+            st.warning(f"A soma das questões selecionadas ({soma}) deve ser igual ao total ({total}).")
         else:
             if st.button("Iniciar Quiz"):
                 quiz = []
-                for t,q in sliders.items():
-                    if q>0:
-                        quiz += extract_questions_by_topic(texto_atual, t, q, banca if banca else None)
-                random.shuffle(quiz)
-                st.session_state['quiz'] = quiz
-                st.session_state['q_idx'] = 0
-                st.session_state['respostas'] = []
-                st.session_state['gabaritos'] = []
-                st.session_state['quiz_fim'] = False
-                st.rerun()
-        if 'quiz' in st.session_state and st.session_state['quiz']:
+                with st.spinner("O Gemini está elaborando as questões..."):
+                    for t, q in sliders.items():
+                        if q > 0:
+                            quiz += extract_questions_by_topic(texto_atual, t, q, banca if banca else None)
+                
+                if quiz:
+                    random.shuffle(quiz)
+                    st.session_state['quiz'] = quiz
+                    st.session_state['q_idx'] = 0
+                    st.session_state['respostas'] = []
+                    st.session_state['gabaritos'] = []
+                    st.session_state['quiz_fim'] = False
+                    st.rerun()
+                else:
+                    st.error("Não foi possível gerar as questões. Tente novamente.")
+                    
+        if 'quiz' in st.session_state and st.session_state['quiz'] and not st.session_state.get('quiz_fim', False):
             idx = st.session_state['q_idx']
-            q = st.session_state['quiz'][idx]
+            q_texto = st.session_state['quiz'][idx]
+            
             st.markdown(f"### Questão {idx+1}/{len(st.session_state['quiz'])}")
-            st.markdown(q)
-            alt = re.findall(r'([a-e])\)\s*(.*)', q)
-            gab = re.search(r'Gabarito:\s*([a-eA-E])', q)
-            gab = gab.group(1).upper() if gab else None
-            resp = st.radio("Sua resposta", [a[0].upper() for a in alt], key=f"resp_{idx}")
-            if st.button("Confirmar e próxima", key=f"prox_{idx}"):
+            
+            # Oculta o gabarito no momento de responder
+            display_q = re.sub(r'Gabarito:.*', '', q_texto, flags=re.IGNORECASE)
+            st.markdown(display_q)
+            
+            alt = re.findall(r'([a-e])\)\s*(.*)', q_texto)
+            gab = re.search(r'Gabarito:\s*([a-eA-E])', q_texto)
+            gab_letra = gab.group(1).upper() if gab else None
+            
+            resp = st.radio("Sua resposta:", [a[0].upper() for a in alt] if alt else ["A","B","C","D","E"], key=f"resp_{idx}")
+            
+            if st.button("Confirmar e ir para próxima", key=f"prox_{idx}"):
                 st.session_state['respostas'].append(resp)
-                st.session_state['gabaritos'].append(gab)
+                st.session_state['gabaritos'].append(gab_letra)
                 if idx+1 < len(st.session_state['quiz']):
-                    st.session_state['q_idx']+=1
+                    st.session_state['q_idx'] += 1
                 else:
                     st.session_state['quiz_fim'] = True
                 st.rerun()
-        if st.session_state.get('quiz_fim'):
-            st.success("Quiz finalizado!")
-            resultados = defaultdict(lambda: {"acertos":0, "total":0})
-            for i,q in enumerate(st.session_state['quiz']):
-                resp = st.session_state['respostas'][i] if i<len(st.session_state['respostas']) else None
+                
+        elif st.session_state.get('quiz_fim'):
+            st.success("Quiz finalizado! Veja seu desempenho.")
+            acertos = 0
+            for i, q in enumerate(st.session_state['quiz']):
+                r_user = st.session_state['respostas'][i] if i < len(st.session_state['respostas']) else None
                 gab = st.session_state['gabaritos'][i]
-                topico = "Geral"
-                resultados[topico]["total"]+=1
-                if resp and gab and resp.upper() == gab.upper():
-                    resultados[topico]["acertos"]+=1
-            st.write("### Desempenho")
-            erros = []
-            for top, dat in resultados.items():
-                perc = dat["acertos"]/dat["total"]*100 if dat["total"] else 0
-                st.write(f"{top}: {dat['acertos']}/{dat['total']} ({perc:.0f}%)")
-                if dat["acertos"] < dat["total"]:
-                    erros.append(top)
-            if erros:
-                st.session_state['topicos_revisar'] = erros
-                st.info("Vá para a aba Revisão Inteligente.")
+                if r_user and gab and r_user == gab:
+                    acertos += 1
+            
+            total_q = len(st.session_state['quiz'])
+            st.metric("Acertos", f"{acertos}/{total_q}", f"{(acertos/total_q)*100:.0f}%")
+            if acertos < total_q:
+                st.session_state['topicos_revisar'] = topicos[:1] 
+                st.info("Alguns erros detectados. Vá para a aba 'Revisão'.")
+            
+            if st.button("Limpar e Tentar Novamente"):
+                del st.session_state['quiz']
+                st.rerun()
 
 with tab4:
-    st.subheader("Revisão Inteligente")
-    if st.button("Gerar revisão dos erros"):
-        erros = st.session_state.get('topicos_revisar', [])
-        if not erros:
-            st.warning("Nenhum erro detectado.")
+    st.subheader("Revisão Inteligente dos Erros")
+    if st.button("Gerar material de revisão"):
+        if not texto_atual:
+            st.warning("Carregue um texto primeiro.")
         else:
-            with st.spinner("Criando revisão..."):
+            erros = st.session_state.get('topicos_revisar', st.session_state.notebooks[active].get('topicos', ['Geral'])[:1])
+            with st.spinner("Criando resumo de reforço com o Gemini..."):
                 for top in erros:
-                    st.markdown(f"### 📌 {top}")
-                    prompt = f"Crie um resumo denso sobre '{top}' do texto.\n\nTexto:\n{texto_atual[:120000]}\n\nResumo:"
-                    st.markdown(llm_generate(prompt, 500))
-                    prompt_f = f"Gere 10 flashcards Certo/Errado sobre '{top}'.\n\nTexto:\n{texto_atual[:120000]}\n\nFlashcards:"
-                    st.markdown(llm_generate(prompt_f, 500))
-            st.success("Material gerado!")
+                    st.markdown(f"### 📌 Reforço de Conteúdo: {top}")
+                    prompt = f"Crie um resumo rápido e focado apenas no assunto '{top}'. Texto base: {texto_atual}"
+                    st.markdown(llm_generate(prompt))
+            st.success("Material de revisão gerado!")
