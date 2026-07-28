@@ -40,7 +40,7 @@ def get_gemini_model():
         
     genai.configure(api_key=api_key)
     # gemini-1.5-flash é super rápido e suporta milhões de tokens (lê PDFs inteiros)
-    return genai.GenerativeModel('gemini-1.5-flash')
+    return genai.GenerativeModel('gemini-1.5-flash-latest')
 
 def llm_generate(prompt):
     try:
