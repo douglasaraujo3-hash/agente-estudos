@@ -63,15 +63,27 @@ def get_gemini_model():
 
     genai.configure(api_key=api_key)
 
+    # Lista modelos disponíveis e escolhe o primeiro que seja flash ou pro
     try:
         models = genai.list_models()
         model_name = None
         for model in models:
-            if 'generateContent' in model.supported_generation_methods and 'gemini-1.5-flash' in model.name:
-                model_name = model.name
-                break
+            if 'generateContent' in model.supported_generation_methods:
+                # Prioriza gemini-1.5-flash, depois pro, depois qualquer 1.5
+                if 'gemini-1.5-flash' in model.name:
+                    model_name = model.name
+                    break
+                elif 'gemini-1.5-pro' in model.name and model_name is None:
+                    model_name = model.name
         if model_name is None:
-            model_name = 'models/gemini-1.5-flash'
+            # Último recurso: pega qualquer modelo que suporte generateContent
+            for model in models:
+                if 'generateContent' in model.supported_generation_methods:
+                    model_name = model.name
+                    break
+        if model_name is None:
+            st.error("Nenhum modelo válido encontrado. Verifique sua chave de API.")
+            st.stop()
         return genai.GenerativeModel(model_name)
     except Exception as e:
         st.error(f"Erro ao conectar à API Gemini: {e}. Verifique sua chave.")
@@ -91,7 +103,6 @@ def llm_generate(prompt, max_tokens=2000, temperature=0.1):
         return ""
 
 def llm_generate_with_images(prompt_parts, max_tokens=2000, temperature=0.1):
-    """Envia prompt com texto + imagens (para OCR)"""
     model = get_gemini_model()
     try:
         generation_config = genai.types.GenerationConfig(
@@ -106,11 +117,6 @@ def llm_generate_with_images(prompt_parts, max_tokens=2000, temperature=0.1):
 
 # ==================== FUNÇÕES DE EXTRAÇÃO E IA ====================
 def extract_text_from_pdf(file_bytes):
-    """
-    Extrai texto de qualquer PDF (texto nativo ou escaneado).
-    Primeiro tenta PyMuPDF; se resultado for pequeno, usa OCR via Gemini.
-    """
-    # 1. Tenta extração direta
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     text = ""
     for page in doc:
@@ -120,26 +126,23 @@ def extract_text_from_pdf(file_bytes):
     if text.strip() and len(text.strip()) > 100:
         return text
 
-    # 2. Se muito pouco texto (provavelmente escaneado), faz OCR via Gemini
-    st.info("📷 PDF escaneado detectado. Usando IA para ler as imagens... (pode levar alguns segundos)")
+    st.info("📷 PDF escaneado detectado. Usando IA para ler as imagens...")
     pdf = pdfium.PdfDocument(file_bytes)
     n_pages = len(pdf)
     all_text = []
 
-    # Processa em lotes de 5 páginas para não sobrecarregar
     for i in range(0, n_pages, 5):
         batch_pages = pdf[i:min(i+5, n_pages)]
         images = []
         for page in batch_pages:
-            bitmap = page.render(scale=2)  # escala 2 para boa qualidade
+            bitmap = page.render(scale=2)
             pil_image = bitmap.to_pil()
             img_byte_arr = io.BytesIO()
             pil_image.save(img_byte_arr, format='PNG')
             img_byte_arr = img_byte_arr.getvalue()
             images.append(img_byte_arr)
 
-        # Monta partes para o prompt multimodal
-        parts = [{"text": "Extraia TODO o texto contido nestas páginas, exatamente como aparece, preservando formatação. Retorne apenas o texto, sem comentários."}]
+        parts = [{"text": "Extraia TODO o texto contido nestas páginas, exatamente como aparece. Retorne apenas o texto."}]
         for img_bytes in images:
             parts.append({"inline_data": {"mime_type": "image/png", "data": base64.b64encode(img_bytes).decode()}})
 
