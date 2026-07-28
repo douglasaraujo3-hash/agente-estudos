@@ -59,7 +59,7 @@ def get_gemini_model():
         st.stop()
     genai.configure(api_key=api_key)
     # Usa Gemini 1.5 Flash (rápido e gratuito)
-    return genai.GenerativeModel('gemini-1.5-flash')
+    return genai.GenerativeModel('gemini-1.5-flash-latest')
 
 def llm_generate(prompt, max_tokens=2000, temperature=0.1):
     model = get_gemini_model()
