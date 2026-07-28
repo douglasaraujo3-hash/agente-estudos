@@ -3,6 +3,7 @@ import fitz  # PyMuPDF
 import re
 import json
 import random
+import time  # Adicionado para as pausas estratégicas
 import google.generativeai as genai
 from collections import defaultdict
 
@@ -28,7 +29,7 @@ def apply_theme():
 
 apply_theme()
 
-# ==================== CONEXÃO GEMINI (À Prova de 404) ====================
+# ==================== CONEXÃO GEMINI ====================
 def get_gemini_model():
     api_key = st.session_state.get("api_key", "")
     if not api_key:
@@ -39,7 +40,7 @@ def get_gemini_model():
         
     genai.configure(api_key=api_key)
     
-    # Busca dinamicamente os modelos disponíveis para evitar o erro "404 Not Found"
+    # Busca dinamicamente os modelos disponíveis
     modelos_disponiveis = []
     try:
         for m in genai.list_models():
@@ -68,14 +69,28 @@ def get_gemini_model():
         st.error(f"Erro ao buscar lista de modelos do Google: {e}")
         st.stop()
 
+# ==================== GERAÇÃO COM PAUSA ESTRATÉGICA (GRÁTIS) ====================
 def llm_generate(prompt):
-    try:
-        model = get_gemini_model()
-        response = model.generate_content(prompt)
-        return response.text
-    except Exception as e:
-        st.error(f"Erro na API do Gemini: {e}")
-        return ""
+    tentativas = 3
+    for i in range(tentativas):
+        try:
+            model = get_gemini_model()
+            response = model.generate_content(prompt)
+            return response.text
+        except Exception as e:
+            erro_str = str(e)
+            # Detecta se bateu no limite do plano gratuito do Google
+            if "429" in erro_str or "Quota" in erro_str:
+                if i < tentativas - 1:
+                    # Notifica o usuário e espera 32 segundos para o limite renovar
+                    st.toast("⏳ Limite de leitura rápida do plano grátis atingido. Aguardando 30 segundos...", icon="⏳")
+                    time.sleep(32)
+                else:
+                    st.error("⚠️ O PDF é gigantesco e usamos todo o limite do minuto. Aguarde um pouquinho e clique de novo.")
+                    return ""
+            else:
+                st.error(f"Erro inesperado na API: {e}")
+                return ""
 
 # ==================== EXTRAÇÃO DE PDF ====================
 def extract_text_from_pdf(file_bytes):
@@ -124,6 +139,9 @@ Formato obrigatório:
 """
     result = llm_generate(prompt_cards)
     
+    if not result:
+        return []
+        
     try:
         clean_json = result.strip().strip("```json").strip("```").strip()
         cards = json.loads(clean_json)
@@ -140,6 +158,9 @@ Texto completo:
 {text}"""
     
     resposta = llm_generate(prompt)
+    if not resposta:
+        return ["Geral"]
+        
     try:
         clean_json = resposta.strip().strip("```json").strip("```").strip()
         topicos = json.loads(clean_json)
@@ -168,6 +189,9 @@ Texto completo:
 {text}
 """
     result = llm_generate(prompt)
+    if not result:
+        return []
+        
     questoes = [bloco.strip() for bloco in result.split('---') if 'Enunciado:' in bloco]
     return questoes[:num_questions]
 
@@ -253,7 +277,7 @@ if uploaded:
                     st.error(f"❌ {f.name} não tem texto extraível. Use um PDF selecionável.")
     
     if st.session_state.notebooks[active]['texto']:
-        with st.spinner("Identificando tópicos..."):
+        with st.spinner("Identificando tópicos do PDF..."):
             st.session_state.notebooks[active]['topicos'] = extract_topics(st.session_state.notebooks[active]['texto'])
 
 if st.session_state.notebooks[active]['pdfs']:
