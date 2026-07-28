@@ -1,7 +1,7 @@
 import streamlit as st
 import fitz  # PyMuPDF
 import re
-from openai import OpenAI
+import google.generativeai as genai
 from collections import defaultdict
 import random
 import json
@@ -49,28 +49,32 @@ def apply_theme():
 
 apply_theme()
 
-# ==================== CONEXÃO DEEPSEEK ====================
-def get_deepseek_client():
-    api_key = st.session_state.get("deepseek_api_key", "")
+# ==================== CONEXÃO GOOGLE GEMINI ====================
+def get_gemini_model():
+    api_key = st.session_state.get("gemini_api_key", "")
     if not api_key:
-        api_key = st.secrets.get("DEEPSEEK_API_KEY", "")
+        api_key = st.secrets.get("GEMINI_API_KEY", "")
     if not api_key:
-        st.error("⚠️ Chave da API DeepSeek não configurada. Insira na barra lateral.")
+        st.error("⚠️ Chave da API Gemini não configurada. Insira na barra lateral.")
         st.stop()
-    return OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
+    genai.configure(api_key=api_key)
+    # Usa Gemini 1.5 Flash (rápido e gratuito)
+    return genai.GenerativeModel('gemini-1.5-flash')
 
 def llm_generate(prompt, max_tokens=2000, temperature=0.1):
-    client = get_deepseek_client()
+    model = get_gemini_model()
     try:
-        response = client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=max_tokens,
-            temperature=temperature,
+        # A API Gemini usa 'max_output_tokens' e 'temperature' no generation_config
+        response = model.generate_content(
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                max_output_tokens=max_tokens,
+                temperature=temperature
+            )
         )
-        return response.choices[0].message.content
+        return response.text
     except Exception as e:
-        st.error(f"Erro na API DeepSeek: {e}")
+        st.error(f"Erro na API Gemini: {e}")
         return ""
 
 # ==================== FUNÇÕES DE EXTRAÇÃO E IA ====================
@@ -82,16 +86,17 @@ def extract_text_from_pdf(file_bytes):
     doc.close()
     return text
 
-def generate_structured_summary(text):
+def generate_structured_summary(text, custom_instruction=""):
     chunk_size = 60000
     chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
     summaries = []
     for i, chunk in enumerate(chunks):
+        extra = f"\n\nInstrução adicional do usuário: {custom_instruction}" if custom_instruction else ""
         prompt = f"""
 Crie um resumo ESQUEMATIZADO e COMPLETO do texto a seguir.
 - Organize em tópicos e subtópicos.
 - NÃO omita detalhes importantes (datas, prazos, fórmulas, exceções, exemplos).
-- Destaque **atualizações jurídicas recentes** e 💡 **dicas de professores**.
+- Destaque **atualizações jurídicas recentes** e 💡 **dicas de professores**.{extra}
 - Seja fiel ao texto original.
 
 Texto (parte {i+1} de {len(chunks)}):
@@ -103,7 +108,7 @@ Resumo Esquematizado:"""
     return "\n\n".join(summaries)
 
 def generate_flashcards(text, num_cards=70, check_coverage=False):
-    # Etapa 1: extrair pontos importantes
+    # Etapa 1: extrair pontos
     prompt_extract = f"Liste TODOS os pontos importantes do texto abaixo que podem cair em prova (definições, prazos, exceções, etc.). Seja exaustivo.\n\nTexto:\n{text[:120000]}\n\nLista:"
     pontos = llm_generate(prompt_extract, max_tokens=3000)
 
@@ -128,11 +133,9 @@ Flashcards ({num_cards}):"""
     for match in re.findall(pattern, result, re.DOTALL):
         frente = match[0].strip()
         verso = match[1].strip()
-        # Tenta identificar se o verso começa com Certo/Errado
         if not (verso.startswith("Certo") or verso.startswith("Errado")):
-            # Caso o modelo não siga exatamente, forçamos um marcador
             if "certo" in verso.lower() or "errado" in verso.lower():
-                pass  # mantém como está
+                pass
             else:
                 verso = "⚠️ " + verso
         cards.append({"frente": frente, "verso": verso})
@@ -147,7 +150,7 @@ Flashcards ({num_cards}):"""
             cards.append({"frente": match[0].strip(), "verso": match[1].strip()})
         cards = cards[:num_cards]
 
-    # Verificação de cobertura (opcional)
+    # Verificação de cobertura
     if check_coverage and cards:
         with st.spinner("Verificando cobertura dos flashcards..."):
             prompt_verify = f"""
@@ -166,7 +169,6 @@ Pontos faltantes (flashcards adicionais, se necessário):"""
             extra_pattern = r"Frente:\s*(.*?)\nVerso:\s*(.*?)(?=\nFrente:|\Z)"
             for match in re.findall(extra_pattern, verification, re.DOTALL):
                 cards.append({"frente": match[0].strip(), "verso": match[1].strip()})
-            # Limita a 120% do número original
             max_total = int(num_cards * 1.2)
             if len(cards) > max_total:
                 cards = cards[:max_total]
@@ -214,7 +216,7 @@ if 'show_delete_confirm' not in st.session_state:
     st.session_state.show_delete_confirm = None
 
 # ==================== INTERFACE ====================
-st.title("📚 Agente de Estudos Pro — Flashcards Certo/Errado")
+st.title("📚 Agente de Estudos Pro — Flashcards Certo/Errado (Gemini)")
 
 with st.sidebar:
     st.header("🎨 Aparência")
@@ -224,13 +226,13 @@ with st.sidebar:
         st.rerun()
 
     st.markdown("---")
-    st.header("🔑 API DeepSeek")
-    api_key = st.text_input("Chave da API", type="password", key="api_key_input")
+    st.header("🔑 API Gemini (Google)")
+    api_key = st.text_input("Chave da API Gemini", type="password", key="api_key_input")
     if api_key:
-        st.session_state.deepseek_api_key = api_key
+        st.session_state.gemini_api_key = api_key
     if st.button("Salvar chave"):
         st.success("Chave salva para esta sessão.")
-    st.info("Chave gratuita em platform.deepseek.com (500 req/dia)")
+    st.info("Obtenha sua chave gratuita em makersuite.google.com/app/apikey")
     st.markdown("---")
 
     st.header("📓 Notebooks")
@@ -321,10 +323,17 @@ tab_resumo, tab_flash, tab_questoes, tab_revisao = st.tabs(
 )
 
 with tab_resumo:
+    st.header("📝 Resumo Esquematizado (Personalizável)")
+    # CAMPO PARA DIGITAR O QUE QUER NO RESUMO
+    custom_resumo = st.text_area(
+        "✨ Instruções para o resumo (opcional):",
+        placeholder="Ex: Dê destaque a prazos, inclua jurisprudência do STF, explique como se fosse para um leigo...",
+        key="custom_resumo"
+    )
     if st.button("🚀 Gerar Resumo Completo"):
         if texto_atual:
             with st.spinner("Gerando resumo..."):
-                resumo = generate_structured_summary(texto_atual)
+                resumo = generate_structured_summary(texto_atual, custom_instruction=custom_resumo)
                 st.session_state['resumo'] = resumo
             st.success("Resumo gerado!")
         else:
@@ -354,7 +363,6 @@ with tab_flash:
         with st.expander("📌 Afirmação", expanded=True):
             st.write(card['frente'])
         with st.expander("🔍 Ver resposta"):
-            # Destaca se é Certo ou Errado
             verso = card['verso']
             if verso.startswith("Certo"):
                 st.success(verso)
