@@ -5,6 +5,10 @@ import google.generativeai as genai
 from collections import defaultdict
 import random
 import json
+import pypdfium2 as pdfium
+from PIL import Image
+import io
+import base64
 
 # ==================== CONFIGURAÇÃO DA PÁGINA ====================
 st.set_page_config(
@@ -59,7 +63,6 @@ def get_gemini_model():
 
     genai.configure(api_key=api_key)
 
-    # Lista modelos e escolhe o gemini-1.5-flash (ou fallback)
     try:
         models = genai.list_models()
         model_name = None
@@ -68,7 +71,7 @@ def get_gemini_model():
                 model_name = model.name
                 break
         if model_name is None:
-            model_name = 'models/gemini-1.5-flash'  # fallback
+            model_name = 'models/gemini-1.5-flash'
         return genai.GenerativeModel(model_name)
     except Exception as e:
         st.error(f"Erro ao conectar à API Gemini: {e}. Verifique sua chave.")
@@ -87,14 +90,65 @@ def llm_generate(prompt, max_tokens=2000, temperature=0.1):
         st.error(f"Erro na API Gemini: {e}. Tente novamente.")
         return ""
 
+def llm_generate_with_images(prompt_parts, max_tokens=2000, temperature=0.1):
+    """Envia prompt com texto + imagens (para OCR)"""
+    model = get_gemini_model()
+    try:
+        generation_config = genai.types.GenerationConfig(
+            max_output_tokens=max_tokens,
+            temperature=temperature
+        )
+        response = model.generate_content(prompt_parts, generation_config=generation_config)
+        return response.text
+    except Exception as e:
+        st.error(f"Erro na API Gemini (OCR): {e}")
+        return ""
+
 # ==================== FUNÇÕES DE EXTRAÇÃO E IA ====================
 def extract_text_from_pdf(file_bytes):
+    """
+    Extrai texto de qualquer PDF (texto nativo ou escaneado).
+    Primeiro tenta PyMuPDF; se resultado for pequeno, usa OCR via Gemini.
+    """
+    # 1. Tenta extração direta
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     text = ""
     for page in doc:
         text += page.get_text()
     doc.close()
-    return text
+
+    if text.strip() and len(text.strip()) > 100:
+        return text
+
+    # 2. Se muito pouco texto (provavelmente escaneado), faz OCR via Gemini
+    st.info("📷 PDF escaneado detectado. Usando IA para ler as imagens... (pode levar alguns segundos)")
+    pdf = pdfium.PdfDocument(file_bytes)
+    n_pages = len(pdf)
+    all_text = []
+
+    # Processa em lotes de 5 páginas para não sobrecarregar
+    for i in range(0, n_pages, 5):
+        batch_pages = pdf[i:min(i+5, n_pages)]
+        images = []
+        for page in batch_pages:
+            bitmap = page.render(scale=2)  # escala 2 para boa qualidade
+            pil_image = bitmap.to_pil()
+            img_byte_arr = io.BytesIO()
+            pil_image.save(img_byte_arr, format='PNG')
+            img_byte_arr = img_byte_arr.getvalue()
+            images.append(img_byte_arr)
+
+        # Monta partes para o prompt multimodal
+        parts = [{"text": "Extraia TODO o texto contido nestas páginas, exatamente como aparece, preservando formatação. Retorne apenas o texto, sem comentários."}]
+        for img_bytes in images:
+            parts.append({"inline_data": {"mime_type": "image/png", "data": base64.b64encode(img_bytes).decode()}})
+
+        batch_text = llm_generate_with_images(parts, max_tokens=4000)
+        if batch_text:
+            all_text.append(batch_text)
+
+    pdf.close()
+    return "\n\n".join(all_text)
 
 def generate_structured_summary(text, custom_instruction=""):
     chunk_size = 60000
@@ -118,11 +172,9 @@ Resumo Esquematizado:"""
     return "\n\n".join(summaries)
 
 def generate_flashcards(text, num_cards=70, check_coverage=False):
-    # Etapa 1: extrair pontos
     prompt_extract = f"Liste TODOS os pontos importantes do texto abaixo que podem cair em prova (definições, prazos, exceções, etc.). Seja exaustivo.\n\nTexto:\n{text[:120000]}\n\nLista:"
     pontos = llm_generate(prompt_extract, max_tokens=3000)
 
-    # Etapa 2: criar flashcards estilo Certo ou Errado
     prompt_cards = f"""A partir da lista de pontos abaixo, crie EXATAMENTE {num_cards} flashcards no formato:
 Frente: [afirmação clara que pode ser verdadeira ou falsa]
 Verso: [Certo ou Errado] + explicação completa + uma mini revisão do assunto (2-3 frases resumindo o conceito)
@@ -150,7 +202,6 @@ Flashcards ({num_cards}):"""
                 verso = "⚠️ " + verso
         cards.append({"frente": frente, "verso": verso})
 
-    # Ajuste de quantidade
     if len(cards) > num_cards:
         cards = cards[:num_cards]
     elif len(cards) < num_cards:
@@ -160,7 +211,6 @@ Flashcards ({num_cards}):"""
             cards.append({"frente": match[0].strip(), "verso": match[1].strip()})
         cards = cards[:num_cards]
 
-    # Verificação de cobertura
     if check_coverage and cards:
         with st.spinner("Verificando cobertura dos flashcards..."):
             prompt_verify = f"""
@@ -307,23 +357,39 @@ active = st.session_state.active_notebook
 st.subheader(f"📖 {active}")
 
 # Upload de PDF
-uploaded_files = st.file_uploader("Arraste PDFs para este notebook", type="pdf", accept_multiple_files=True, key=f"upload_{active}")
+st.subheader("📤 Upload de PDFs (qualquer tipo)")
+uploaded_files = st.file_uploader(
+    "Arraste PDFs para este notebook",
+    type="pdf",
+    accept_multiple_files=True,
+    key=f"upload_{active}"
+)
+
 if uploaded_files:
     for uploaded in uploaded_files:
         if uploaded.name not in st.session_state.notebooks[active]['pdfs']:
-            st.session_state.notebooks[active]['pdfs'].append(uploaded.name)
-            texto_extraido = extract_text_from_pdf(uploaded.getvalue())
-            st.session_state.notebooks[active]['texto'] += texto_extraido + "\n\n"
+            with st.spinner(f"Processando {uploaded.name}..."):
+                texto_extraido = extract_text_from_pdf(uploaded.getvalue())
+                if texto_extraido.strip():
+                    st.session_state.notebooks[active]['pdfs'].append(uploaded.name)
+                    st.session_state.notebooks[active]['texto'] += texto_extraido + "\n\n"
+                    st.success(f"✅ {uploaded.name} ({len(texto_extraido)} caracteres extraídos)")
+                else:
+                    st.error(f"❌ Não foi possível extrair texto de {uploaded.name}. O arquivo pode estar corrompido.")
     if st.session_state.notebooks[active]['texto']:
-        topicos = extract_topics(st.session_state.notebooks[active]['texto'])
-        st.session_state.notebooks[active]['topicos'] = topicos
-    st.success(f"PDFs adicionados: {', '.join(st.session_state.notebooks[active]['pdfs'])}")
+        with st.spinner("Identificando tópicos..."):
+            topicos = extract_topics(st.session_state.notebooks[active]['texto'])
+            st.session_state.notebooks[active]['topicos'] = topicos
 
 if st.session_state.notebooks[active]['pdfs']:
-    st.caption(f"PDFs: {', '.join(st.session_state.notebooks[active]['pdfs'])}")
+    st.caption(f"📚 PDFs carregados: {', '.join(st.session_state.notebooks[active]['pdfs'])}")
+    tamanho = len(st.session_state.notebooks[active]['texto'])
+    st.caption(f"📊 Total de texto extraído: {tamanho} caracteres")
     if st.button("🗑️ Remover todos os PDFs"):
         st.session_state.notebooks[active] = {"pdfs": [], "texto": "", "topicos": []}
         st.rerun()
+else:
+    st.warning("⬆️ Nenhum PDF carregado. Arraste arquivos para começar.")
 
 texto_atual = st.session_state.notebooks[active]['texto']
 
