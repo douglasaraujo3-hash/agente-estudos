@@ -28,7 +28,7 @@ def apply_theme():
 
 apply_theme()
 
-# ==================== CONEXÃO GEMINI ====================
+# ==================== CONEXÃO GEMINI (À Prova de Erros 404) ====================
 def get_gemini_model():
     api_key = st.session_state.get("api_key", "")
     if not api_key:
@@ -39,50 +39,61 @@ def get_gemini_model():
         
     genai.configure(api_key=api_key)
     
-    modelos_disponiveis = []
     try:
-        for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods:
-                nome_limpo = m.name.replace("models/", "")
-                modelos_disponiveis.append(nome_limpo)
-                
+        # Busca dinamicamente e limpa os nomes
+        modelos_disponiveis = [m.name.replace("models/", "") for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        
         modelo_escolhido = None
-        for m in modelos_disponiveis:
-            if "flash" in m:
-                modelo_escolhido = m
-                break
-        if not modelo_escolhido:
+        
+        # 1º Tenta a versão 1.5 flash exata (Estável e liberada para todos)
+        if "gemini-1.5-flash" in modelos_disponiveis:
+            modelo_escolhido = "gemini-1.5-flash"
+        # 2º Tenta a versão 1.5 flash latest
+        elif "gemini-1.5-flash-latest" in modelos_disponiveis:
+            modelo_escolhido = "gemini-1.5-flash-latest"
+        # 3º Procura outro flash, MAS IGNORA a versão 2.5 que está dando bloqueio
+        else:
             for m in modelos_disponiveis:
-                if "pro" in m:
+                if "flash" in m and "2.5" not in m:
                     modelo_escolhido = m
                     break
+                    
+        # Se não achou nenhum flash seguro, pega o primeiro que funcionar
         if not modelo_escolhido and modelos_disponiveis:
             modelo_escolhido = modelos_disponiveis[0]
             
         return genai.GenerativeModel(modelo_escolhido)
+        
     except Exception as e:
         st.error(f"Erro ao buscar lista de modelos: {e}")
         st.stop()
 
-# ==================== GERAÇÃO COM PAUSA ESTRATÉGICA ====================
+# ==================== GERAÇÃO COM RETENTATIVA AUTOMÁTICA ====================
 def llm_generate(prompt):
-    tentativas = 3
+    tentativas = 4  # Vai tentar sozinho até 4 vezes antes de desistir
+    
     for i in range(tentativas):
         try:
             model = get_gemini_model()
             response = model.generate_content(prompt)
             return response.text
+            
         except Exception as e:
             erro_str = str(e)
-            if "429" in erro_str or "Quota" in erro_str:
+            
+            # Se o erro for limite de cota (429, Quota exceeded)
+            if "429" in erro_str or "Quota" in erro_str or "exceeded" in erro_str.lower():
                 if i < tentativas - 1:
-                    st.toast("⏳ O Google pediu uma pausa (plano gratuito). Retomando em 30 segundos...", icon="⏳")
-                    time.sleep(32)
+                    # Avisa na tela que está pausando, e o time.sleep segura o código sozinho
+                    st.toast(f"⏳ O limite gratuito esgotou. Tentando de novo sozinho em 30 segundos... (Tentativa {i+1} de {tentativas-1})", icon="⏳")
+                    time.sleep(32) # Pausa de 32 segundos automaticamente
+                    continue # Volta para o começo do For e tenta gerar de novo sozinho
                 else:
-                    st.error("⚠️ Limite do minuto esgotado. Aguarde um pouco e clique novamente.")
+                    st.error("⚠️ O Google bloqueou após várias tentativas automáticas. O PDF é muito grande ou o limite gratuito diário foi atingido.")
                     return ""
             else:
-                st.error(f"Erro inesperado: {e}")
+                # Se for outro erro diferente, mostra na tela
+                st.error(f"Erro na IA: {erro_str}")
                 return ""
 
 # ==================== EXTRAÇÃO DE PDF ====================
@@ -184,7 +195,7 @@ if 'active_notebook' not in st.session_state:
 
 # ==================== INTERFACE ====================
 st.title("📚 Agente de Estudos Pro — Modo Direto")
-st.caption("A IA só lê e processa o documento quando você dá um comando, economizando seus limites grátis.")
+st.caption("A IA só lê e processa o documento quando você dá um comando, economizando limites grátis.")
 
 with st.sidebar:
     st.header("🎨 Aparência")
@@ -223,7 +234,7 @@ if not st.session_state.active_notebook:
 
 active = st.session_state.active_notebook
 
-# Upload de PDF (Agora ele SÓ extrai o texto, não analisa nada no fundo)
+# Upload de PDF
 uploaded = st.file_uploader(f"Carregar PDFs no notebook '{active}'", type="pdf", accept_multiple_files=True)
 if uploaded:
     for f in uploaded:
@@ -235,25 +246,25 @@ if uploaded:
                     st.session_state.notebooks[active]['texto'] += txt + "\n\n"
                     st.success(f"✅ {f.name} carregado!")
 
-# Corte de segurança para o plano gratuito (Limita a ~50 páginas por vez)
+# Corte de segurança: Limitamos para evitar que PDFs de mil páginas travem permanentemente sua cota
 texto_completo = st.session_state.notebooks[active].get('texto', "")
-texto_seguro = texto_completo[:150000]
+texto_seguro = texto_completo[:150000] 
 
 if len(texto_completo) > 150000:
-    st.info("💡 PDF muito longo! Para evitar bloqueio do Google gratuito, a IA analisará o limite máximo de segurança por vez (cerca de 50 páginas).")
+    st.info("💡 PDF longo! Para não estourar o limite de leitura, a IA se baseará numa fatia de aproximadamente 50 páginas.")
 
 if not texto_seguro:
     st.warning("Nenhum texto carregado. Faça upload de um PDF.")
     st.stop()
 
 # Tabs de Comando Direto
-tab1, tab2, tab3, tab4 = st.tabs(["📝 Resumo Sob Demanda", "🃏 Flashcards Direcionados", "❓ Questões Específicas", "💬 Consulta Livre (Chat)"])
+tab1, tab2, tab3, tab4 = st.tabs(["📝 Resumo", "🃏 Flashcards", "❓ Questões", "💬 Chat / Busca"])
 
 with tab1:
     st.subheader("Resumir partes específicas")
     comando_resumo = st.text_input("O que você quer que a IA busque e resuma?", placeholder="Ex: Resuma as hipóteses de prisão preventiva")
     if st.button("🚀 Gerar Resumo Direcionado"):
-        with st.spinner("Buscando no texto..."):
+        with st.spinner("Analisando o texto... (Se aparecer o aviso de limite, não clique novamente, a IA aguardará sozinha)."):
             st.session_state['resumo'] = generate_structured_summary(texto_seguro, comando_resumo)
     if 'resumo' in st.session_state:
         st.markdown(st.session_state['resumo'])
@@ -264,7 +275,7 @@ with tab2:
     n = st.slider("Quantidade de Cards", 5, 30, 10, 5)
     
     if st.button("Gerar Flashcards"):
-        with st.spinner("Extraindo e criando os cards..."):
+        with st.spinner("Extraindo os cards... (Se aparecer o aviso de limite, a IA aguardará sozinha)."):
             st.session_state['flashcards'] = generate_flashcards(texto_seguro, comando_flash, n)
             st.session_state['card_idx'] = 0
             
@@ -295,7 +306,7 @@ with tab3:
     total = st.number_input("Total de questões desejadas", 1, 20, 5)
     
     if st.button("Iniciar Busca e Criar Quiz"):
-        with st.spinner("A IA está buscando esse assunto no PDF..."):
+        with st.spinner("Elaborando as questões... (A IA aguardará sozinha caso atinja o limite do Google)."):
             quiz = extract_questions_by_topic(texto_seguro, comando_questoes, total, banca)
             if quiz:
                 st.session_state['quiz'] = quiz
@@ -345,7 +356,7 @@ with tab4:
     
     if st.button("Buscar resposta no PDF"):
         if pergunta_direta:
-            with st.spinner("Procurando..."):
+            with st.spinner("Procurando... (Se der limite, deixarei pausado sozinho até continuar)"):
                 prompt = f"Responda a esta pergunta baseando-se EXCLUSIVAMENTE no texto abaixo. Pergunta: {pergunta_direta}\n\nTexto:\n{texto_seguro}"
                 st.info(llm_generate(prompt))
         else:
