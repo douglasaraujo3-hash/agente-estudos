@@ -1,11 +1,10 @@
 import streamlit as st
 import fitz  # PyMuPDF
 import re
-import google.generativeai as genai
+from openai import OpenAI
 from collections import defaultdict
 import random
 import json
-import time
 
 # ==================== CONFIGURAÇÃO DA PÁGINA ====================
 st.set_page_config(page_title="Agente de Estudos Pro", layout="wide", initial_sidebar_state="expanded")
@@ -30,92 +29,38 @@ def apply_theme():
 
 apply_theme()
 
-# ==================== CONEXÃO GEMINI 2.0 FLASH ====================
-MODEL_NAME = "gemini-2.0-flash"  # MODELO CORRETO E GRATUITO
-
-def get_gemini_client():
-    api_key = st.session_state.get("gemini_api_key", "")
+# ==================== CONEXÃO DEEPSEEK ====================
+def get_deepseek_client():
+    api_key = st.session_state.get("deepseek_api_key", "")
     if not api_key:
-        api_key = st.secrets.get("GEMINI_API_KEY", "")
+        api_key = st.secrets.get("DEEPSEEK_API_KEY", "")
     if not api_key:
-        st.error("⚠️ Chave da API Gemini não configurada. Cole na barra lateral.")
+        st.error("⚠️ Chave da API DeepSeek não configurada. Insira na barra lateral.")
         st.stop()
-    genai.configure(api_key=api_key)
-    return genai.GenerativeModel(MODEL_NAME)
+    return OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
 
 def llm_generate(prompt, max_tokens=2000, temperature=0.1):
     try:
-        model = get_gemini_client()
-        response = model.generate_content(
-            prompt,
-            generation_config=genai.types.GenerationConfig(
-                max_output_tokens=max_tokens,
-                temperature=temperature
-            )
+        client = get_deepseek_client()
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+            temperature=temperature,
         )
-        return response.text
+        return response.choices[0].message.content
     except Exception as e:
-        st.error(f"Erro na API Gemini: {e}")
+        st.error(f"Erro na API DeepSeek: {e}")
         return ""
 
-def llm_generate_with_images(prompt_parts, max_tokens=2000):
-    try:
-        model = get_gemini_client()
-        response = model.generate_content(
-            prompt_parts,
-            generation_config=genai.types.GenerationConfig(max_output_tokens=max_tokens)
-        )
-        return response.text
-    except Exception as e:
-        st.error(f"Erro no OCR: {e}")
-        return ""
-
-# ==================== EXTRAÇÃO DE PDF (COM OCR PARA ESCANEADOS) ====================
+# ==================== EXTRAÇÃO DE PDF ====================
 def extract_text_from_pdf(file_bytes):
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     text = ""
     for page in doc:
         text += page.get_text()
     doc.close()
-
-    if text.strip() and len(text.strip()) > 100:
-        return text
-
-    # Se veio pouco texto, tenta OCR via Gemini
-    st.info("📷 PDF escaneado detectado. Usando IA para extrair texto...")
-    try:
-        import pypdfium2 as pdfium
-        from PIL import Image
-        import io, base64
-
-        pdf = pdfium.PdfDocument(file_bytes)
-        n_pages = len(pdf)
-        all_text = []
-        for i in range(0, n_pages, 3):
-            batch_pages = pdf[i:min(i+3, n_pages)]
-            images = []
-            for page in batch_pages:
-                bitmap = page.render(scale=2)
-                pil_image = bitmap.to_pil()
-                img_bytes = io.BytesIO()
-                pil_image.save(img_bytes, format='PNG')
-                img_bytes = img_bytes.getvalue()
-                images.append(img_bytes)
-
-            parts = [{"text": "Extraia TODO o texto destas páginas, preservando formatação. Apenas o texto."}]
-            for img in images:
-                parts.append({"inline_data": {"mime_type": "image/png", "data": base64.b64encode(img).decode()}})
-            batch_text = llm_generate_with_images(parts, max_tokens=4000)
-            if batch_text:
-                all_text.append(batch_text)
-        pdf.close()
-        return "\n\n".join(all_text)
-    except ImportError:
-        st.error("❌ PDF escaneado requer OCR. Instale 'pypdfium2' no requirements.txt.")
-        return ""
-    except Exception as e:
-        st.error(f"❌ Falha ao processar PDF escaneado: {e}")
-        return ""
+    return text
 
 # ==================== FUNÇÕES DE IA ====================
 def generate_structured_summary(text, custom_instruction=""):
@@ -232,7 +177,7 @@ if 'show_delete_confirm' not in st.session_state:
     st.session_state.show_delete_confirm = None
 
 # ==================== INTERFACE ====================
-st.title("📚 Agente de Estudos Pro — Online (Gemini 2.0 Flash)")
+st.title("📚 Agente de Estudos Pro — Online (DeepSeek 500 req/dia grátis)")
 
 with st.sidebar:
     st.header("🎨 Aparência")
@@ -242,13 +187,13 @@ with st.sidebar:
         st.rerun()
 
     st.markdown("---")
-    st.header("🔑 API Gemini (Google)")
-    api_key = st.text_input("Chave da API Gemini", type="password")
+    st.header("🔑 API DeepSeek")
+    api_key = st.text_input("Chave da API DeepSeek", type="password")
     if api_key:
-        st.session_state.gemini_api_key = api_key
+        st.session_state.deepseek_api_key = api_key
     if st.button("Salvar chave"):
         st.success("Chave salva para esta sessão.")
-    st.info("Obtenha sua chave gratuita em https://aistudio.google.com/apikey")
+    st.info("Obtenha sua chave gratuita em https://platform.deepseek.com (500 req/dia)")
     st.markdown("---")
 
     st.header("📓 Notebooks")
